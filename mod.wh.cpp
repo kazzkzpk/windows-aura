@@ -1924,6 +1924,149 @@ bool MatchesClassSubkey(HKEY hKey, std::wstring_view classSubKey) {
     classSubKey.size()) == 0;
 }
 
+namespace TaskbarHide {
+LSTATUS OverrideRegDwordZero(LSTATUS ret,
+                             LPDWORD lpType,
+                             LPBYTE lpData,
+                             LPDWORD lpcbData) {
+    if (ret == ERROR_FILE_NOT_FOUND) {
+        ret = ERROR_SUCCESS;
+    }
+    if (ret != ERROR_SUCCESS && ret != ERROR_MORE_DATA) {
+        return ret;
+    }
+
+    if (lpType) {
+        *lpType = REG_DWORD;
+    }
+
+    if (!lpData || !lpcbData) {
+        if (lpcbData) {
+            *lpcbData = sizeof(DWORD);
+        }
+        return ERROR_SUCCESS;
+    }
+
+    if (*lpcbData < sizeof(DWORD)) {
+        *lpcbData = sizeof(DWORD);
+        return ERROR_MORE_DATA;
+    }
+
+    *reinterpret_cast<DWORD*>(lpData) = 0;
+    *lpcbData = sizeof(DWORD);
+    return ERROR_SUCCESS;
+}
+
+bool ShouldForceRegDwordZero(PCWSTR valueName) {
+    return valueName &&
+           (_wcsicmp(valueName, L"ColorPrevalence") == 0 ||
+            _wcsicmp(valueName, L"SearchboxTaskbarMode") == 0 ||
+            _wcsicmp(valueName, L"TaskbarSi") == 0 ||
+            _wcsicmp(valueName, L"TaskbarSh") == 0 ||
+            _wcsicmp(valueName, L"ShowTaskViewButton") == 0 ||
+            _wcsicmp(valueName, L"TaskbarDa") == 0 ||
+            _wcsicmp(valueName, L"TaskbarMn") == 0);
+}
+
+using RegGetValueW_t = decltype(&RegGetValueW);
+RegGetValueW_t RegGetValueW_Original;
+
+LSTATUS WINAPI RegGetValueW_Hook(HKEY hkey,
+                                 LPCWSTR lpSubKey,
+                                 LPCWSTR lpValue,
+                                 DWORD dwFlags,
+                                 LPDWORD pdwType,
+                                 PVOID pvData,
+                                 LPDWORD pcbData) {
+    LSTATUS ret = RegGetValueW_Original(hkey, lpSubKey, lpValue, dwFlags, pdwType,
+                                        pvData, pcbData);
+
+    if (!ShouldForceRegDwordZero(lpValue)) {
+        return ret;
+    }
+
+    return OverrideRegDwordZero(ret, pdwType, reinterpret_cast<LPBYTE>(pvData),
+                                pcbData);
+}
+
+bool HookKernelFunction(PCSTR targetName, void* hookFunction, void** originalFunction) {
+    HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
+    HMODULE kernel32Module = GetModuleHandle(L"kernel32.dll");
+
+    void* targetFunction = nullptr;
+    if (kernelBaseModule) {
+        targetFunction = (void*)GetProcAddress(kernelBaseModule, targetName);
+    }
+    if (!targetFunction && kernel32Module) {
+        targetFunction = (void*)GetProcAddress(kernel32Module, targetName);
+    }
+    if (!targetFunction) {
+        return false;
+    }
+
+    return Wh_SetFunctionHook(targetFunction, hookFunction, originalFunction);
+}
+
+bool InstallHooks() {
+    return HookKernelFunction("RegGetValueW", (void*)RegGetValueW_Hook,
+                              (void**)&RegGetValueW_Original);
+}
+
+bool IsExplorerProcess() {
+    WCHAR modulePath[MAX_PATH];
+    if (!GetModuleFileName(nullptr, modulePath, ARRAYSIZE(modulePath))) {
+        return false;
+    }
+
+    PCWSTR moduleName = wcsrchr(modulePath, L'\\');
+    if (!moduleName) {
+        return false;
+    }
+
+    return _wcsicmp(moduleName + 1, L"explorer.exe") == 0;
+}
+
+void ApplyRegistry() {
+    DWORD zero = 0;
+    const struct {
+        PCWSTR subKey;
+        PCWSTR valueName;
+    } values[] = {
+        {L"Software\\Microsoft\\Windows\\CurrentVersion\\Search",
+         L"SearchboxTaskbarMode"},
+        {L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+         L"TaskbarSi"},
+        {L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+         L"TaskbarSh"},
+        {L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+         L"ShowTaskViewButton"},
+        {L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+         L"TaskbarDa"},
+        {L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+         L"TaskbarMn"},
+    };
+
+    for (const auto& value : values) {
+        RegSetKeyValue(HKEY_CURRENT_USER, value.subKey, value.valueName,
+                       RRF_RT_REG_DWORD, &zero, sizeof(zero));
+    }
+}
+
+void Apply() {
+    if (!IsExplorerProcess()) {
+        return;
+    }
+
+    ApplyRegistry();
+    InstallHooks();
+
+    SendNotifyMessage(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                      (LPARAM)L"Software\\Microsoft\\Windows\\CurrentVersion\\Search");
+    SendNotifyMessage(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                      (LPARAM)L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced");
+}
+}  // namespace TaskbarHide
+
 using RegQueryValueExW_t = decltype(&RegQueryValueExW);
 RegQueryValueExW_t RegQueryValueExW_Original;
 LSTATUS WINAPI RegQueryValueExW_Hook(HKEY hKey,
@@ -2044,28 +2187,8 @@ LPDWORD lpcbData) {
         return ret;
     }
 
-    if (_wcsicmp(lpValueName, L"ColorPrevalence") == 0) {
-        if (ret == ERROR_FILE_NOT_FOUND) {
-            ret = ERROR_SUCCESS;
-        }
-        if (ret == ERROR_SUCCESS || ret == ERROR_MORE_DATA) {
-            if (lpType) {
-                *lpType = REG_DWORD;
-            }
-            if (!lpData || !lpcbData) {
-                if (lpcbData) {
-                    *lpcbData = sizeof(DWORD);
-                }
-                return ERROR_SUCCESS;
-            }
-            if (*lpcbData < sizeof(DWORD)) {
-                *lpcbData = sizeof(DWORD);
-                return ERROR_MORE_DATA;
-            }
-            *reinterpret_cast<DWORD*>(lpData) = 0;
-            *lpcbData = sizeof(DWORD);
-            return ERROR_SUCCESS;
-        }
+    if (TaskbarHide::ShouldForceRegDwordZero(lpValueName)) {
+        return TaskbarHide::OverrideRegDwordZero(ret, lpType, lpData, lpcbData);
     }
 
     if (g_settings.calculateFolderSizes == CalculateFolderSizes::disabled) {
@@ -3379,6 +3502,10 @@ BOOL Wh_ModInit() {
 
     if (!NeutralChrome::InstallHooks()) {
         Wh_Log(L"Failed hooking neutral window chrome");
+    }
+
+    if (TaskbarHide::IsExplorerProcess()) {
+        TaskbarHide::Apply();
     }
 
     if (g_settings.calculateFolderSizes != CalculateFolderSizes::disabled) {
