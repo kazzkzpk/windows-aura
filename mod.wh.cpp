@@ -10,7 +10,6 @@
 // @exclude         Plex*.exe
 // @exclude         backgroundTaskHost.exe
 // @exclude         LockApp.exe
-// @exclude         SearchHost.exe
 // @exclude         ShellExperienceHost.exe
 // @exclude         StartMenuExperienceHost.exe
 // @compilerOptions -lole32 -loleaut32 -lpropsys -ldwmapi -luser32
@@ -18,6 +17,8 @@
 // ==/WindhawkMod==
 
 // Better file sizes in Explorer details (m417z/windhawk-mods, GPL-3.0)
+// Invisible window borders (Bo0ii/windhawk-mods, MIT)
+// Start Search Bing Redirector (takattowo, MIT)
 
 // ==WindhawkModReadme==
 /*
@@ -100,6 +101,21 @@ KiB?](https://devblogs.microsoft.com/oldnewthing/20090611-00/?p=17933).
   $name: "Explorer: Filesize use IEC terms"
   $description: >-
     Use the International Electronic Commission terms, such as KiB instead of KB
+- engine: google
+  $name: "Menu: Search Engine"
+  $options:
+  - google: Google
+  - duckduckgo: DuckDuckGo
+  - kagi: Kagi
+  - brave: Brave Search
+  - ecosia: Ecosia
+  - yahoo: Yahoo
+  - startpage: Startpage
+  - custom: Custom (use template below)
+- customTemplate: https://www.google.com/search?q={q}
+  $name: "Menu: Search Engine Custom"
+  $description: >-
+    Used only when engine is set to Custom. Use {q} as the query placeholder.
 */
 // ==/WindhawkModSettings==
 
@@ -128,6 +144,7 @@ using namespace std::string_view_literals;
 #include <shtypes.h>
 #include <winrt/base.h>
 #include <dwmapi.h>
+#include <winstring.h>
 
 enum class CalculateFolderSizes {
     disabled,
@@ -2697,33 +2714,76 @@ namespace NeutralChrome {
 #ifndef DWMSBT_NONE
 #define DWMSBT_NONE 1
 #endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_COLOR_NONE
+#define DWMWA_COLOR_NONE 0xFFFFFFFE
+#endif
+#ifndef DWMWA_COLOR_DEFAULT
+#define DWMWA_COLOR_DEFAULT 0xFFFFFFFF
+#endif
 
 using DwmSetWindowAttribute_t = decltype(&DwmSetWindowAttribute);
 DwmSetWindowAttribute_t DwmSetWindowAttribute_Original;
+
+constexpr bool kApplyToSpecialWindows = false;
+constexpr COLORREF kBorderInvisible = DWMWA_COLOR_NONE;
+constexpr COLORREF kBorderDefault = DWMWA_COLOR_DEFAULT;
+
+bool IsValidWindow(HWND hwnd) {
+    DWORD style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    return (style & WS_THICKFRAME) == WS_THICKFRAME ||
+           (style & WS_CAPTION) == WS_CAPTION ||
+           (kApplyToSpecialWindows && (style & WS_OVERLAPPED) == WS_OVERLAPPED &&
+            (style & WS_POPUP) != WS_POPUP);
+}
+
+void SetBorderInvisible(HWND hwnd) {
+    if (!hwnd || !DwmSetWindowAttribute_Original || !IsValidWindow(hwnd)) {
+        return;
+    }
+
+    DwmSetWindowAttribute_Original(hwnd, DWMWA_BORDER_COLOR, &kBorderInvisible,
+                                   sizeof(kBorderInvisible));
+}
+
+void SetBorderDefault(HWND hwnd) {
+    if (!hwnd || !DwmSetWindowAttribute_Original || !IsValidWindow(hwnd)) {
+        return;
+    }
+
+    DwmSetWindowAttribute_Original(hwnd, DWMWA_BORDER_COLOR, &kBorderDefault,
+                                   sizeof(kBorderDefault));
+}
 
 void ApplyToWindow(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) {
         return;
     }
 
-    LONG style = GetWindowLongPtr(hwnd, GWL_STYLE);
-    if (!(style & WS_CAPTION)) {
-        return;
+    if (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CAPTION) {
+        int backdrop = DWMSBT_NONE;
+        DwmSetWindowAttribute_Original(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop,
+                                       sizeof(backdrop));
+
+        BOOL micaOff = FALSE;
+        DwmSetWindowAttribute_Original(hwnd, DWMWA_MICA_EFFECT, &micaOff,
+                                       sizeof(micaOff));
     }
 
-    int backdrop = DWMSBT_NONE;
-    DwmSetWindowAttribute_Original(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop,
-                                   sizeof(backdrop));
-
-    BOOL micaOff = FALSE;
-    DwmSetWindowAttribute_Original(hwnd, DWMWA_MICA_EFFECT, &micaOff,
-                                   sizeof(micaOff));
+    SetBorderInvisible(hwnd);
 }
 
 HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd,
                                           DWORD dwAttribute,
                                           LPCVOID pvAttribute,
                                           DWORD cbAttribute) {
+    if (dwAttribute == DWMWA_BORDER_COLOR && IsValidWindow(hwnd)) {
+        return DwmSetWindowAttribute_Original(hwnd, dwAttribute, &kBorderInvisible,
+                                            sizeof(kBorderInvisible));
+    }
+
     if (dwAttribute == DWMWA_SYSTEMBACKDROP_TYPE && pvAttribute &&
         cbAttribute >= sizeof(int)) {
         int backdrop = DWMSBT_NONE;
@@ -2735,11 +2795,113 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd,
         cbAttribute >= sizeof(BOOL)) {
         BOOL micaOff = FALSE;
         return DwmSetWindowAttribute_Original(hwnd, dwAttribute, &micaOff,
-                                             sizeof(micaOff));
+                                              sizeof(micaOff));
     }
 
     return DwmSetWindowAttribute_Original(hwnd, dwAttribute, pvAttribute,
-                                        cbAttribute);
+                                          cbAttribute);
+}
+
+using DefWindowProcA_t = decltype(&DefWindowProcA);
+DefWindowProcA_t DefWindowProcA_Original;
+LRESULT WINAPI DefWindowProcA_Hook(HWND hwnd,
+                                   UINT uMsg,
+                                   WPARAM wParam,
+                                   LPARAM lParam) {
+    LRESULT result =
+        DefWindowProcA_Original(hwnd, uMsg, wParam, lParam);
+
+    switch (uMsg) {
+    case WM_ACTIVATE:
+    case WM_NCACTIVATE:
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+        SetBorderInvisible(hwnd);
+        break;
+    }
+
+    return result;
+}
+
+using DefWindowProcW_t = decltype(&DefWindowProcW);
+DefWindowProcW_t DefWindowProcW_Original;
+LRESULT WINAPI DefWindowProcW_Hook(HWND hwnd,
+                                   UINT uMsg,
+                                   WPARAM wParam,
+                                   LPARAM lParam) {
+    LRESULT result =
+        DefWindowProcW_Original(hwnd, uMsg, wParam, lParam);
+
+    switch (uMsg) {
+    case WM_ACTIVATE:
+    case WM_NCACTIVATE:
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+        SetBorderInvisible(hwnd);
+        break;
+    }
+
+    return result;
+}
+
+using DefDlgProcA_t = decltype(&DefDlgProcA);
+DefDlgProcA_t DefDlgProcA_Original;
+LRESULT WINAPI DefDlgProcA_Hook(HWND hwnd,
+                                  UINT uMsg,
+                                  WPARAM wParam,
+                                  LPARAM lParam) {
+    LRESULT result = DefDlgProcA_Original(hwnd, uMsg, wParam, lParam);
+
+    if (uMsg == WM_NCACTIVATE) {
+        SetBorderInvisible(hwnd);
+    }
+
+    return result;
+}
+
+using DefDlgProcW_t = decltype(&DefDlgProcW);
+DefDlgProcW_t DefDlgProcW_Original;
+LRESULT WINAPI DefDlgProcW_Hook(HWND hwnd,
+                                  UINT uMsg,
+                                  WPARAM wParam,
+                                  LPARAM lParam) {
+    LRESULT result = DefDlgProcW_Original(hwnd, uMsg, wParam, lParam);
+
+    if (uMsg == WM_NCACTIVATE) {
+        SetBorderInvisible(hwnd);
+    }
+
+    return result;
+}
+
+BOOL CALLBACK ApplyToProcessWindow(HWND hwnd, LPARAM lParam) {
+    DWORD processId = static_cast<DWORD>(lParam);
+    DWORD windowProcessId = 0;
+    GetWindowThreadProcessId(hwnd, &windowProcessId);
+
+    if (processId == windowProcessId) {
+        ApplyToWindow(hwnd);
+    }
+
+    return TRUE;
+}
+
+BOOL CALLBACK RestoreProcessWindow(HWND hwnd, LPARAM lParam) {
+    DWORD processId = static_cast<DWORD>(lParam);
+    DWORD windowProcessId = 0;
+    GetWindowThreadProcessId(hwnd, &windowProcessId);
+
+    if (processId == windowProcessId) {
+        SetBorderDefault(hwnd);
+    }
+
+    return TRUE;
+}
+
+void ApplyToProcessWindows() {
+    EnumWindows(ApplyToProcessWindow, GetCurrentProcessId());
+}
+
+void RestoreProcessWindows() {
+    EnumWindows(RestoreProcessWindow, GetCurrentProcessId());
 }
 
 using CreateWindowExW_t = decltype(&CreateWindowExW);
@@ -2763,11 +2925,6 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
         ApplyToWindow(hwnd);
     }
     return hwnd;
-}
-
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
-    ApplyToWindow(hwnd);
-    return TRUE;
 }
 
 bool HookKernelFunction(PCSTR targetName, void* hookFunction, void** originalFunction) {
@@ -2809,15 +2966,371 @@ bool InstallHooks() {
         hooked = true;
     }
 
+    if (Wh_SetFunctionHook((void*)DefWindowProcW, (void*)DefWindowProcW_Hook,
+                           (void**)&DefWindowProcW_Original)) {
+        hooked = true;
+    }
+
+    if (Wh_SetFunctionHook((void*)DefWindowProcA, (void*)DefWindowProcA_Hook,
+                           (void**)&DefWindowProcA_Original)) {
+        hooked = true;
+    }
+
+    if (Wh_SetFunctionHook((void*)DefDlgProcW, (void*)DefDlgProcW_Hook,
+                           (void**)&DefDlgProcW_Original)) {
+        hooked = true;
+    }
+
+    if (Wh_SetFunctionHook((void*)DefDlgProcA, (void*)DefDlgProcA_Hook,
+                           (void**)&DefDlgProcA_Original)) {
+        hooked = true;
+    }
+
     if (HookKernelFunction("RegQueryValueExW", (void*)RegQueryValueExW_Hook,
                            (void**)&RegQueryValueExW_Original)) {
         hooked = true;
     }
 
-    EnumWindows(EnumWindowsProc, 0);
     return hooked;
 }
 }  // namespace NeutralChrome
+
+namespace StartSearch {
+enum class Engine {
+    Google,
+    DuckDuckGo,
+    Kagi,
+    Brave,
+    Ecosia,
+    Yahoo,
+    Startpage,
+    Custom,
+};
+
+struct SearchSettings {
+    Engine engine = Engine::Google;
+    std::wstring customTemplate = L"https://www.google.com/search?q={q}";
+};
+
+SearchSettings g_searchSettings;
+thread_local bool g_inHook = false;
+
+Engine ParseEngine(PCWSTR value) {
+    if (!value) {
+        return Engine::Google;
+    }
+    if (_wcsicmp(value, L"duckduckgo") == 0) {
+        return Engine::DuckDuckGo;
+    }
+    if (_wcsicmp(value, L"kagi") == 0) {
+        return Engine::Kagi;
+    }
+    if (_wcsicmp(value, L"brave") == 0) {
+        return Engine::Brave;
+    }
+    if (_wcsicmp(value, L"ecosia") == 0) {
+        return Engine::Ecosia;
+    }
+    if (_wcsicmp(value, L"yahoo") == 0) {
+        return Engine::Yahoo;
+    }
+    if (_wcsicmp(value, L"startpage") == 0) {
+        return Engine::Startpage;
+    }
+    if (_wcsicmp(value, L"custom") == 0) {
+        return Engine::Custom;
+    }
+    return Engine::Google;
+}
+
+const wchar_t* EngineBaseUrl(Engine engine) {
+    switch (engine) {
+    case Engine::Google:
+        return L"https://www.google.com/search?q=";
+    case Engine::DuckDuckGo:
+        return L"https://duckduckgo.com/?q=";
+    case Engine::Kagi:
+        return L"https://kagi.com/search?q=";
+    case Engine::Brave:
+        return L"https://search.brave.com/search?q=";
+    case Engine::Ecosia:
+        return L"https://www.ecosia.org/search?q=";
+    case Engine::Yahoo:
+        return L"https://search.yahoo.com/search?p=";
+    case Engine::Startpage:
+        return L"https://www.startpage.com/do/search?query=";
+    case Engine::Custom:
+        return nullptr;
+    }
+    return nullptr;
+}
+
+void LoadSettings() {
+    PCWSTR engine = Wh_GetStringSetting(L"engine");
+    g_searchSettings.engine = ParseEngine(engine);
+    if (engine) {
+        Wh_FreeStringSetting(engine);
+    }
+
+    PCWSTR tmpl = Wh_GetStringSetting(L"customTemplate");
+    g_searchSettings.customTemplate =
+        (tmpl && *tmpl) ? std::wstring(tmpl)
+                        : std::wstring(L"https://www.google.com/search?q={q}");
+    if (tmpl) {
+        Wh_FreeStringSetting(tmpl);
+    }
+}
+
+std::wstring UrlEncode(std::wstring_view input) {
+    int byteCount = WideCharToMultiByte(CP_UTF8, 0, input.data(),
+                                        static_cast<int>(input.size()), nullptr,
+                                        0, nullptr, nullptr);
+    if (byteCount <= 0) {
+        return std::wstring(input);
+    }
+
+    std::string utf8(byteCount, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, input.data(), static_cast<int>(input.size()),
+                        utf8.data(), byteCount, nullptr, nullptr);
+
+    std::wstring output;
+    output.reserve(input.size());
+    char buffer[8];
+    for (unsigned char byte : utf8) {
+        if ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
+            byte == '.' || byte == '~') {
+            output.push_back(static_cast<wchar_t>(byte));
+        } else {
+            wsprintfA(buffer, "%%%02X", byte);
+            for (int i = 0; buffer[i]; ++i) {
+                output.push_back(static_cast<wchar_t>(buffer[i]));
+            }
+        }
+    }
+    return output;
+}
+
+std::wstring UrlDecode(std::wstring_view input) {
+    std::string utf8;
+    utf8.reserve(input.size());
+
+    for (size_t i = 0; i < input.size(); ++i) {
+        wchar_t ch = input[i];
+        if (ch == L'+') {
+            utf8.push_back(' ');
+        } else if (ch == L'%' && i + 2 < input.size() &&
+                   iswxdigit(input[i + 1]) && iswxdigit(input[i + 2])) {
+            auto hex = [](wchar_t digit) {
+                if (digit >= L'0' && digit <= L'9') {
+                    return digit - L'0';
+                }
+                if (digit >= L'a' && digit <= L'f') {
+                    return 10 + (digit - L'a');
+                }
+                if (digit >= L'A' && digit <= L'F') {
+                    return 10 + (digit - L'A');
+                }
+                return 0;
+            };
+            utf8.push_back(static_cast<char>((hex(input[i + 1]) << 4) |
+                                             hex(input[i + 2])));
+            i += 2;
+        } else if (ch < 128) {
+            utf8.push_back(static_cast<char>(ch));
+        } else {
+            char buffer[8];
+            int count = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, buffer,
+                                            sizeof(buffer), nullptr, nullptr);
+            if (count > 0) {
+                utf8.append(buffer, count);
+            }
+        }
+    }
+
+    int wideCount =
+        MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()),
+                            nullptr, 0);
+    if (wideCount <= 0) {
+        return std::wstring(input);
+    }
+
+    std::wstring output(wideCount, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()),
+                        output.data(), wideCount);
+    return output;
+}
+
+std::wstring BuildEngineUrl(std::wstring_view encodedQuery) {
+    if (g_searchSettings.engine == Engine::Custom) {
+        std::wstring url = g_searchSettings.customTemplate;
+        const std::wstring placeholder = L"{q}";
+        size_t pos = url.find(placeholder);
+        if (pos == std::wstring::npos) {
+            url.append(encodedQuery);
+        } else {
+            url.replace(pos, placeholder.size(), encodedQuery);
+        }
+        return url;
+    }
+
+    std::wstring url = EngineBaseUrl(g_searchSettings.engine);
+    url.append(encodedQuery);
+    return url;
+}
+
+bool StartsWithI(std::wstring_view value, std::wstring_view prefix) {
+    if (value.size() < prefix.size()) {
+        return false;
+    }
+    return _wcsnicmp(value.data(), prefix.data(), prefix.size()) == 0;
+}
+
+size_t FindI(std::wstring_view haystack, std::wstring_view needle,
+             size_t from = 0) {
+    if (needle.empty() || from > haystack.size()) {
+        return std::wstring::npos;
+    }
+
+    for (size_t i = from; i + needle.size() <= haystack.size(); ++i) {
+        if (_wcsnicmp(haystack.data() + i, needle.data(), needle.size()) == 0) {
+            return i;
+        }
+    }
+    return std::wstring::npos;
+}
+
+std::pair<size_t, size_t> FindQueryParam(std::wstring_view value,
+                                         std::wstring_view key) {
+    size_t from = 0;
+    while (from < value.size()) {
+        size_t pos = FindI(value, key, from);
+        if (pos == std::wstring::npos) {
+            break;
+        }
+        if ((pos == 0 || value[pos - 1] == L'?' || value[pos - 1] == L'&') &&
+            pos + key.size() < value.size() &&
+            value[pos + key.size()] == L'=') {
+            size_t valueStart = pos + key.size() + 1;
+            size_t valueEnd = value.find_first_of(L"&#", valueStart);
+            if (valueEnd == std::wstring::npos) {
+                valueEnd = value.size();
+            }
+            return {valueStart, valueEnd};
+        }
+        from = pos + key.size();
+    }
+    return {std::wstring::npos, std::wstring::npos};
+}
+
+std::wstring RewriteBingHttpUrl(std::wstring_view url) {
+    if (FindI(url, L"bing.com/search?") == std::wstring::npos) {
+        return {};
+    }
+
+    auto [queryStart, queryEnd] = FindQueryParam(url, L"q");
+    if (queryStart == std::wstring::npos) {
+        return {};
+    }
+
+    std::wstring rawQuery(url.substr(queryStart, queryEnd - queryStart));
+    return BuildEngineUrl(UrlEncode(UrlDecode(rawQuery)));
+}
+
+std::wstring TryRewriteActivationUrl(std::wstring_view inputUrl) {
+    constexpr std::wstring_view edgePrefix = L"microsoft-edge:";
+    if (!StartsWithI(inputUrl, edgePrefix)) {
+        return {};
+    }
+
+    std::wstring_view rest = inputUrl;
+    rest.remove_prefix(edgePrefix.size());
+    if (rest.empty() || rest[0] != L'?') {
+        return {};
+    }
+
+    auto [valueStart, valueEnd] = FindQueryParam(rest, L"url");
+    if (valueStart == std::wstring::npos) {
+        return {};
+    }
+
+    std::wstring decodedInner =
+        UrlDecode(rest.substr(valueStart, valueEnd - valueStart));
+    std::wstring rewritten = RewriteBingHttpUrl(decodedInner);
+    if (rewritten.empty()) {
+        return {};
+    }
+
+    Wh_Log(L"[StartSearch] Rewrote: %ls -> %ls", std::wstring(inputUrl).c_str(),
+           rewritten.c_str());
+    return rewritten;
+}
+
+using WindowsCreateString_t = HRESULT(WINAPI*)(PCNZWCH, UINT32, HSTRING*);
+WindowsCreateString_t WindowsCreateString_Original;
+
+HRESULT WINAPI WindowsCreateString_Hook(PCNZWCH sourceString,
+                                        UINT32 length,
+                                        HSTRING* string) {
+    if (!sourceString || length < 15 || g_inHook) {
+        return WindowsCreateString_Original(sourceString, length, string);
+    }
+
+    if (_wcsnicmp(sourceString, L"microsoft-edge:", 15) != 0) {
+        return WindowsCreateString_Original(sourceString, length, string);
+    }
+
+    g_inHook = true;
+    std::wstring input(sourceString, length);
+    std::wstring rewritten = TryRewriteActivationUrl(input);
+    g_inHook = false;
+
+    if (!rewritten.empty()) {
+        return WindowsCreateString_Original(rewritten.c_str(),
+                                            static_cast<UINT32>(rewritten.size()),
+                                            string);
+    }
+
+    return WindowsCreateString_Original(sourceString, length, string);
+}
+
+bool IsSearchProcess() {
+    WCHAR modulePath[MAX_PATH];
+    if (!GetModuleFileName(nullptr, modulePath, ARRAYSIZE(modulePath))) {
+        return false;
+    }
+
+    PCWSTR moduleName = wcsrchr(modulePath, L'\\');
+    if (!moduleName) {
+        return false;
+    }
+    moduleName++;
+
+    return _wcsicmp(moduleName, L"SearchHost.exe") == 0 ||
+           _wcsicmp(moduleName, L"SearchApp.exe") == 0;
+}
+
+bool InstallHooks() {
+    HMODULE combaseModule = GetModuleHandleW(L"combase.dll");
+    if (!combaseModule) {
+        combaseModule = LoadLibraryW(L"combase.dll");
+    }
+    if (!combaseModule) {
+        Wh_Log(L"[StartSearch] combase.dll not available");
+        return false;
+    }
+
+    auto createString = (WindowsCreateString_t)GetProcAddress(
+        combaseModule, "WindowsCreateString");
+    if (!createString) {
+        Wh_Log(L"[StartSearch] WindowsCreateString not found");
+        return false;
+    }
+
+    return WindhawkUtils::Wh_SetFunctionHookT(
+        createString, WindowsCreateString_Hook, &WindowsCreateString_Original);
+}
+}  // namespace StartSearch
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
     switch (fdwReason) {
@@ -2846,6 +3359,7 @@ void LoadSettings() {
     g_settings.sortSizesMixFolders = true;
     g_settings.disableKbOnlySizes = true;
     g_settings.useIecTerms = Wh_GetIntSetting(L"useIecTerms");
+    StartSearch::LoadSettings();
 }
 
 BOOL Wh_ModInit() {
@@ -2854,6 +3368,14 @@ BOOL Wh_ModInit() {
     ProcessShutdownMessageBoxFix::LogErrorIfAny();
 
     LoadSettings();
+
+    if (StartSearch::IsSearchProcess()) {
+        if (!StartSearch::InstallHooks()) {
+            Wh_Log(L"Failed hooking Start Search");
+            return FALSE;
+        }
+        return TRUE;
+    }
 
     if (!NeutralChrome::InstallHooks()) {
         Wh_Log(L"Failed hooking neutral window chrome");
@@ -2953,6 +3475,18 @@ BOOL Wh_ModInit() {
     return TRUE;
 }
 
+void Wh_ModAfterInit() {
+    if (!StartSearch::IsSearchProcess()) {
+        NeutralChrome::ApplyToProcessWindows();
+    }
+}
+
+void Wh_ModBeforeUninit() {
+    if (!StartSearch::IsSearchProcess()) {
+        NeutralChrome::RestoreProcessWindows();
+    }
+}
+
 void Wh_ModUninit() {
     Wh_Log(L">");
 
@@ -2969,6 +3503,7 @@ void Wh_ModUninit() {
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
     Wh_Log(L">");
+    StartSearch::LoadSettings();
     *bReload = TRUE;
     return TRUE;
 }
