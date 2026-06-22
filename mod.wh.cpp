@@ -13,7 +13,7 @@
 // @exclude         SearchHost.exe
 // @exclude         ShellExperienceHost.exe
 // @exclude         StartMenuExperienceHost.exe
-// @compilerOptions -lole32 -loleaut32 -lpropsys
+// @compilerOptions -lole32 -loleaut32 -lpropsys -ldwmapi -luser32
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -127,6 +127,7 @@ using namespace std::string_view_literals;
 #include <shobjidl.h>
 #include <shtypes.h>
 #include <winrt/base.h>
+#include <dwmapi.h>
 
 enum class CalculateFolderSizes {
     disabled,
@@ -2026,6 +2027,34 @@ LPDWORD lpcbData) {
         return ret;
     }
 
+    if (_wcsicmp(lpValueName, L"ColorPrevalence") == 0) {
+        if (ret == ERROR_FILE_NOT_FOUND) {
+            ret = ERROR_SUCCESS;
+        }
+        if (ret == ERROR_SUCCESS || ret == ERROR_MORE_DATA) {
+            if (lpType) {
+                *lpType = REG_DWORD;
+            }
+            if (!lpData || !lpcbData) {
+                if (lpcbData) {
+                    *lpcbData = sizeof(DWORD);
+                }
+                return ERROR_SUCCESS;
+            }
+            if (*lpcbData < sizeof(DWORD)) {
+                *lpcbData = sizeof(DWORD);
+                return ERROR_MORE_DATA;
+            }
+            *reinterpret_cast<DWORD*>(lpData) = 0;
+            *lpcbData = sizeof(DWORD);
+            return ERROR_SUCCESS;
+        }
+    }
+
+    if (g_settings.calculateFolderSizes == CalculateFolderSizes::disabled) {
+        return ret;
+    }
+
     const auto replacementIt =
     std::find_if(std::begin(replacements), std::end(replacements),
     [lpValueName](const auto& replacement) {
@@ -2655,6 +2684,141 @@ namespace ProcessShutdownMessageBoxFix {
 
 }  // namespace ProcessShutdownMessageBoxFix
 
+namespace NeutralChrome {
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
+#ifndef DWMWA_MICA_EFFECT
+#define DWMWA_MICA_EFFECT 1029
+#endif
+#ifndef DWMSBT_NONE
+#define DWMSBT_NONE 1
+#endif
+
+using DwmSetWindowAttribute_t = decltype(&DwmSetWindowAttribute);
+DwmSetWindowAttribute_t DwmSetWindowAttribute_Original;
+
+void ApplyToWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+
+    LONG style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    if (!(style & WS_CAPTION)) {
+        return;
+    }
+
+    int backdrop = DWMSBT_NONE;
+    DwmSetWindowAttribute_Original(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop,
+                                   sizeof(backdrop));
+
+    BOOL micaOff = FALSE;
+    DwmSetWindowAttribute_Original(hwnd, DWMWA_MICA_EFFECT, &micaOff,
+                                   sizeof(micaOff));
+}
+
+HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd,
+                                          DWORD dwAttribute,
+                                          LPCVOID pvAttribute,
+                                          DWORD cbAttribute) {
+    if (dwAttribute == DWMWA_SYSTEMBACKDROP_TYPE && pvAttribute &&
+        cbAttribute >= sizeof(int)) {
+        int backdrop = DWMSBT_NONE;
+        return DwmSetWindowAttribute_Original(hwnd, dwAttribute, &backdrop,
+                                              sizeof(backdrop));
+    }
+
+    if (dwAttribute == DWMWA_MICA_EFFECT && pvAttribute &&
+        cbAttribute >= sizeof(BOOL)) {
+        BOOL micaOff = FALSE;
+        return DwmSetWindowAttribute_Original(hwnd, dwAttribute, &micaOff,
+                                             sizeof(micaOff));
+    }
+
+    return DwmSetWindowAttribute_Original(hwnd, dwAttribute, pvAttribute,
+                                        cbAttribute);
+}
+
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+CreateWindowExW_t CreateWindowExW_Original;
+HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
+                                 LPCWSTR lpClassName,
+                                 LPCWSTR lpWindowName,
+                                 DWORD dwStyle,
+                                 int X,
+                                 int Y,
+                                 int nWidth,
+                                 int nHeight,
+                                 HWND hWndParent,
+                                 HMENU hMenu,
+                                 HINSTANCE hInstance,
+                                 LPVOID lpParam) {
+    HWND hwnd = CreateWindowExW_Original(
+        dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight,
+        hWndParent, hMenu, hInstance, lpParam);
+    if (hwnd) {
+        ApplyToWindow(hwnd);
+    }
+    return hwnd;
+}
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    ApplyToWindow(hwnd);
+    return TRUE;
+}
+
+bool HookKernelFunction(PCSTR targetName, void* hookFunction, void** originalFunction) {
+    HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
+    HMODULE kernel32Module = GetModuleHandle(L"kernel32.dll");
+
+    void* targetFunction = nullptr;
+    if (kernelBaseModule) {
+        targetFunction = (void*)GetProcAddress(kernelBaseModule, targetName);
+    }
+    if (!targetFunction && kernel32Module) {
+        targetFunction = (void*)GetProcAddress(kernel32Module, targetName);
+    }
+    if (!targetFunction) {
+        return false;
+    }
+
+    return Wh_SetFunctionHook(targetFunction, hookFunction, originalFunction);
+}
+
+bool InstallHooks() {
+    bool hooked = false;
+
+    HMODULE dwmModule = LoadLibrary(L"dwmapi.dll");
+    if (dwmModule) {
+        DwmSetWindowAttribute_Original =
+            (DwmSetWindowAttribute_t)GetProcAddress(dwmModule,
+                                                    "DwmSetWindowAttribute");
+        if (DwmSetWindowAttribute_Original) {
+            WindhawkUtils::Wh_SetFunctionHookT(DwmSetWindowAttribute_Original,
+                                               DwmSetWindowAttribute_Hook,
+                                               &DwmSetWindowAttribute_Original);
+            hooked = true;
+        }
+    }
+
+    if (WindhawkUtils::Wh_SetFunctionHookT(CreateWindowExW, CreateWindowExW_Hook,
+                                         &CreateWindowExW_Original)) {
+        hooked = true;
+    }
+
+    if (HookKernelFunction("RegQueryValueExW", (void*)RegQueryValueExW_Hook,
+                           (void**)&RegQueryValueExW_Original)) {
+        hooked = true;
+    }
+
+    EnumWindows(EnumWindowsProc, 0);
+    return hooked;
+}
+}  // namespace NeutralChrome
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
@@ -2691,21 +2855,14 @@ BOOL Wh_ModInit() {
 
     LoadSettings();
 
+    if (!NeutralChrome::InstallHooks()) {
+        Wh_Log(L"Failed hooking neutral window chrome");
+    }
+
     if (g_settings.calculateFolderSizes != CalculateFolderSizes::disabled) {
         if (!HookWindowsStorageSymbols()) {
             Wh_Log(L"Failed hooking Windows Storage symbols");
             return false;
-        }
-
-        HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
-        if (kernelBaseModule) {
-            auto pRegQueryValueExW = (RegQueryValueExW_t)GetProcAddress(
-            kernelBaseModule, "RegQueryValueExW");
-            if (pRegQueryValueExW) {
-                WindhawkUtils::Wh_SetFunctionHookT(pRegQueryValueExW,
-                RegQueryValueExW_Hook,
-                &RegQueryValueExW_Original);
-            }
         }
     }
 
